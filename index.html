@@ -1,0 +1,971 @@
+<html>
+<head>
+    <style>
+      body {
+        font-family: "Consolas", monospace;
+        color: #111;
+        background: #fff;
+      }
+
+      table td {
+        padding: 3px;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid lightgrey;
+        border-collapse: collapse;
+      }
+
+      p {
+        margin: 8px 0;
+      }
+
+      p.gi > b {
+        color: #777
+      }
+
+      details {
+        border: 1px solid #aaa;
+        border-radius: 4px;
+        padding: .5em .5em 0;
+        display: inline-block;
+      }
+
+      summary {
+        margin: -.5em -.5em 0;
+        padding: .5em;
+        cursor: pointer;
+        background: #eee;
+      }
+
+      details[open] > summary {
+        border-bottom: 1px solid #aaa;
+        margin-bottom: .5em;
+      }
+
+      details[open] {
+        padding: .5em;
+      }
+
+      span.ok {
+        color: green;
+      }
+
+      span.wrn {
+        color: #fc8803;
+      }
+
+      span.err {
+        color: red;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        body {
+          color: #dedede;
+          background: #1f2121;
+        }
+
+        a {
+          color: #809fff;
+        }
+
+        th,
+        td {
+          border-bottom-color: #555;
+        }
+
+        p.gi > b {
+          color: #999
+        }
+
+        summary {
+          background: #282a2a;
+        }
+
+        span.ok {
+          color: #77beaf;
+        }
+
+        span.wrn {
+          color: #fb7e6f;
+        }
+
+        span.err {
+          color: #fd79b1;
+        }
+      }
+    </style>
+</head>
+  <script>
+    function red(message) { return `<span class="err">${message}</span>` }
+    function yellow(message) { return `<span class="wrn">${message}</span>`}
+    function green(message) { return  `<span class="ok">${message}</span>`}
+
+    function streamingFailureErrorCodeToHumanString(code) {
+        switch(code) {
+        case 13:
+            return "Can't initialize video encoder";
+        case 14:
+            return "Can't initialize audio encoder";
+        case 15:
+            return "Internal error: processing initialization failure";
+        case 16:
+            return "Video queue limit reached, likely performance issue";
+        case 17:
+            return "Audio queue limit reached";
+        case 18:
+            return "Hardware encoder issue, probably hardware problems with video card";
+        case 19:
+            return "No available destinations, likely all streaming destinations are set up incorrectly";
+        case 20:
+            return "Frame queue size reached without Antilag enabled";
+        default:
+            console.log("unexpected streaming failure code", code);
+            throw new Error("unexpected streaming failure code");
+        }
+    }
+
+    function streamingStatusColorized(status) {
+        switch(status) {
+        case "perfect_streaming":
+            return green(status);
+        case "anti_lag":
+            return red(status);
+        case "connection_slow":
+            return yellow(status);
+        case "cpu_high":
+            return yellow(status);
+        case "connection_lost":
+            return red(status);
+        case "audio_peak":
+            return yellow(status);
+        case "local_encoding":
+            return green(status);
+        default:
+            return status;
+        }
+    }
+
+
+      function parseLogLine(logLineNumber, time, verbosity, threadId, message, ctx) {
+
+        let currentStreaming;
+
+        ctx.streaming = ctx.streaming || {
+            sessions: []
+        };
+
+        if(ctx.streaming.sessions.length > 0) {
+            currentStreaming = ctx.streaming.sessions[ctx.streaming.sessions.length-1]
+        }
+
+        // Livestream Studio Version 6.8.185-macosx-x64-master-382c3d1-mac1-02017 starting...
+        let res;
+        if( res = message.match(/Livestream Studio (Beta )?Version (\d+\.\d+.\d+)-([^-]+)-([^-]+)-(.*) (\w*)/ ) ) {
+            ctx.isBeta = res[1] !== undefined;
+            ctx.studioVersion = res[2];
+            ctx.platform = res[3];
+            ctx.isWin = ctx.platform == "win32";
+            ctx.isMac = ctx.platform == "macosx";
+            if(!ctx.isWin && !ctx.isMac) {
+                console.log("unknown platform:", ctx.platform, {message});
+                throw new Error("unknown platform");
+            }
+
+            if(res[4] != "x64") {
+                // likely incorrectly parsed line
+                console.log("non x64 build", {message, res})
+                throw new Error("non x64 build");
+            }
+
+            if(res[6] === "starting") {
+                ctx.launchedAt = time;
+            } else if(res[6] === "stopped") {
+                ctx.stoppedAt = time;
+            }
+        }
+
+        if( message == "[Warmup] Begin" ) {
+            ctx.warmup = ctx.warmup || {};
+            ctx.warmup.beginTime = time;
+        }
+
+        if( message == "[Warmup] End" ) {
+            ctx.warmup = ctx.warmup || {};
+            ctx.warmup.endTime = time;
+        }
+
+        // BlackMagic DeckLink Driver v10.11.2.0 available.
+        if( res = message.match(/BlackMagic DeckLink Driver (.*) available./) ) {
+            ctx.devices = ctx.devices || {};
+            ctx.devices.blackMagicDriverVersion = res[1]
+        }
+
+        // QLSStudioDeviceManager::OnDevicePlugged "FaceTime HD Camera (Built-in)" (unique_id="macvideo://0x1420000005ac8600", cap_flags=1)
+        if( res = message.match(/QLSStudioDeviceManager::OnDevicePlugged "(.*)" \(unique_id="(.*)", cap_flags=(\d+)\)/) ) {
+            ctx.devices = ctx.devices || {};
+            const id = res[2];
+            ctx.devices.list = ctx.devices.list || {};
+            ctx.devices.list[id] = {
+                name: res[1],
+                isCaptureDevice: res[3] == "1" || res[3] == "3",
+                isStreamingDevice: res[3] == "2" || res[3] == "3"
+            }
+
+            ctx.devices.log = ctx.devices.log || [];
+            ctx.devices.log.push({
+                time,
+                id,
+                logLineNumber,
+                message: "plugged"
+            })
+        }
+
+        // QLSStudioDeviceManager::OnDeviceUnplugged unique_id="macvideo://0x1420000005ac8600"
+        if( res = message.match(/QLSStudioDeviceManager::OnDeviceUnplugged unique_id="(.*)"/) ) {
+            ctx.devices = ctx.devices || {};
+            const id = res[1];
+
+            ctx.devices.log = ctx.devices.log || [];
+            ctx.devices.log.push({
+                time,
+                id,
+                logLineNumber,
+                message: "unplugged"
+            })
+        }
+
+        // IsHardwareAccelerationAvailable: checking for intel [res:0]
+        if( res = message.match(/IsHardwareAccelerationAvailable: checking for (.*) \[res:1\]/) ) {
+            ctx.streaming.hwEnc = ctx.streaming.hwEnc || new Set();
+            ctx.streaming.hwEnc.add(res[1]);
+        }
+
+        // CCaptureDeviceSource[140459456802304]: PlugDevice - dev_id="macvideo://0x1420000005ac8600"
+        if( res = message.match(/CCaptureDeviceSource\[\d*\]: PlugDevice - dev_id="(.*)"/) ) {
+            ctx.devices = ctx.devices || {};
+            ctx.devices.log = ctx.devices.log || [];
+            ctx.devices.log.push({
+                time,
+                id: res[1],
+                logLineNumber,
+                message: "assigned to input"
+            })
+        }
+
+        // QLSStreamingManager::StartStreaming
+	    // video.width=1280, video.height=720, video.streaming=0, video.shape=16:9
+		// video.ticks_per_sec=240000, video.ticks_per_frame=8000
+		// audio.channels_count=2, audio.ticks_per_second=5
+		// video_notification_reserve=7519, processing_reserve=3679, switching_latency=30000
+		// streaming_dev.receive_delay_reserve=0.024, streaming_dev.pass_latency=0.048
+        if( res = message.split("\n").join(" ").match(/QLSStreamingManager::StartStreaming\s+video\.width=(\d+),\svideo.height=(\d+),\svideo.streaming=(\d+),\svideo\.shape=([^\s]*)\s+video\.ticks_per_sec=(\d+),\svideo.ticks_per_frame=(\d+)\s+audio.channels_count=(\d).*/)) {
+            ctx.format = {
+                videoWidth: parseInt(res[1]),
+                videoHeight: parseInt(res[2]),
+                interlaced: res[3] != "0",
+                frameShape: res[4],
+                frameRateNum: parseInt(res[5]),
+                frameRateDen: parseInt(res[6]),
+                audioChannels: parseInt(res[7])
+            }
+        }
+
+        // QWebControlMonitor::ActivateSession liveinterview_id=g.mjjmy3p7av
+        if( res = message.match(/QWebControlMonitor::ActivateSession liveinterview_id=(.*)$/)) {
+            ctx.remoteGuests = ctx.remoteGuests || {};
+            ctx.remoteGuests.ids = ctx.remoteGuests.ids || new Set();
+            ctx.remoteGuests.ids.add(res[1]);
+        }
+
+        // QHttpReply:: QHttpReply type=2, url=https://api.mixpanel.com/track/?data=eyJldmVudCI6IlN0dWRpbyBPbmJv...WE5ODU1ODQ2NzY0OWIifX0=&ip=1, manager=140459449289696
+        if( res = message.match(/HttpReply:: QHttpReply type=2, url=https:\/\/api.mixpanel.com\/track\/\?data=(.*)&ip=1, manager=\d*/) ) {
+            const obj = JSON.parse(atob(res[1]));
+
+            ctx.analytics = ctx.analytics || {};
+            ctx.analytics.distinctId = obj.properties.distinct_id;
+            if(obj.properties.sp_vimeo_user_uri) {
+                ctx.analytics.vimeoUserUris = ctx.analytics.vimeoUserUris || new Set();
+                ctx.analytics.vimeoUserUris.add(obj.properties.sp_vimeo_user_uri);
+            }
+            if(obj.properties.sp_license_type) {
+                ctx.analytics.licenseType = obj.properties.sp_license_type;
+            }
+            if(obj.properties.sp_os_version) {
+                ctx.analytics.osVersion = obj.properties.sp_os_version;
+            }
+
+            if(obj.properties.sp_os_type) {
+                ctx.analytics.platform = obj.properties.sp_os_type;
+            }
+
+            if(obj.properties.sp_studio_version) {
+                ctx.analytics.studioVersion = obj.properties.sp_studio_version.replace(" BETA", "");
+            }
+
+            if(obj.properties.sp_is_beta_build) {
+                ctx.analytics.isBeta = obj.properties.sp_is_beta_build;
+            }
+
+            ctx.analytics.events = ctx.analytics.events || [];
+            ctx.analytics.events.push({...obj, time, logLineNumber});
+        }
+
+        // QLSStudioWnd shown
+        if(message === "QLSStudioWnd shown") {
+            ctx.shownAt = time;
+        }
+
+        // CStudioFreeVersionLoginControl::StudioInstanceAllowed
+        if(message === "CStudioFreeVersionLoginControl::StudioInstanceAllowed") {
+            ctx.allowedAt = ctx.allowedAt || time;
+        }
+
+        // RequestStartStreaming
+        if(message === "RequestStartStreaming") {
+            if(currentStreaming && currentStreaming.stopRequestedAt === undefined) {
+                throw new Error("multiple RequestStartStreaming without RequestStopStreaming or failure log");
+            }
+
+            ctx.streaming.sessions.push({
+                startRequestedAt: time,
+                log: []
+            });
+
+            currentStreaming = ctx.streaming.sessions[ctx.streaming.sessions.length-1];
+
+            currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: "User requested <b>start</b> streaming"
+                })
+
+        }
+
+        // CNetworkStreamSession::CNetworkStreamSession profile_count=1, video_encoder_config.key_frame_interval_sec=2, video_encoder_config.cbr=0, video_encoder_config.stop_queue=300
+        if( res = message.match(/CNetworkStreamSession::CNetworkStreamSession profile_count=(\d+), video_encoder_config.key_frame_interval_sec=(\d+), video_encoder_config.cbr=(\d+), video_encoder_config.stop_queue=(\d+)/) ) {
+            if( !currentStreaming ) {
+                // it's possible that part of log with RequestStartStreaming was removed
+                console.log("CNetworkStreamSession::CNetworkStreamSession without current session")
+            } else {
+                currentStreaming.config = currentStreaming.config || {};
+                currentStreaming.config.profilesCount = parseInt(res[1]);
+                currentStreaming.config.keyFrameInterval = parseInt(res[2]);
+                currentStreaming.config.cbr = parseInt(res[3]);
+                currentStreaming.config.stopEncodingQueueSize = parseInt(res[4]);
+            }
+        }
+
+        // RequestStopStreaming
+        if(message === "RequestStopStreaming") {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was removed
+                console.log("RequestStopStreaming without current session")
+            } else if(currentStreaming.stopRequestedAt) {
+                // might be some race condition between RequestStopStreaming and streaming failed event
+                console.log("RequestStopStreaming received twice");
+            } else {
+                currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: "User requested <b>stop</b> streaming"
+                })
+
+                currentStreaming.stopRequestedAt = time;
+            }
+        }
+
+        // QNetworkStreamManager::OnInitializationFailed (error_code=13)
+        if( message.match(/QNetworkStreamManager::OnInitializationFailed \(error_code=(\d+)\)/) ) {
+            const code = parseInt(res[1]);
+
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("OnInitializationFailed without current session")
+            } else {
+                currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: `Streaming couldn't be started due to error ${code} (${streamingFailureErrorCodeToHumanString(code)})`
+                })
+
+                currentStreaming.processingError = code;
+                currentStreaming.stopRequestedAt = time;
+            }
+        }
+
+        // QNetworkStreamManager::OnProcessingError 16
+        if( res = message.match(/QNetworkStreamManager::OnProcessingError (\d+)/)) {
+            const code = parseInt(res[1]);
+
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("OnProcessingError without current session")
+            } else {
+                currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: `Streaming stopped due to error ${code} (${streamingFailureErrorCodeToHumanString(code)})`
+                })
+
+                currentStreaming.processingError = code;
+                currentStreaming.stopRequestedAt = time;
+            }
+        }
+
+        // QNetworkStreamManager::customEvent send finalized
+        if( message == "QNetworkStreamManager::customEvent send finalized" ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("finalized without current session")
+            } else {
+                currentStreaming.processingError = currentStreaming.processingError || "unknown";
+                currentStreaming.stopRequestedAt = currentStreaming.stopRequestedAt || time;
+            }
+
+        }
+
+        // QNetworkStreamingManager::CBroadcast::UpdateStatus: Provider 'rtmp-0' (Custom RTMP): status changed, new status 'connection_slow', prev status 'perfect_streaming'
+        if( res = message.match(/QNetworkStreamingManager::CBroadcast::UpdateStatus: Provider '(.*)' \(.*\): status changed, new status '(.*)', prev status '(.*)'/) ) {
+            const name = res[1] == 'stf' ? 'stream-to-file' : res[1];
+
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QNetworkStreamingManager::CBroadcast::UpdateStatus without current session")
+            } else {
+                currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: `Provider '<b>${name}</b>' status changed (${streamingStatusColorized(res[3])} -> ${streamingStatusColorized(res[2])})`
+                })
+            }
+        }
+
+        // QMultiStreamSessionBase[livestream]::Init profiles=3
+        if( res = message.match(/QMultiStreamSessionBase\[livestream\]::Init profiles=\d+/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QMultiStreamSessionBase::Init without current session")
+            } else {
+                currentStreaming.multiPresetQualityMakesSense = true;
+            }
+
+        }
+
+        // QNetworkStreamingManager::CBroadcast::UpdateStatus: Global status changed, new status 'perfect_streaming', prev status 'connection_slow'
+        if( res = message.match(/QNetworkStreamingManager::CBroadcast::UpdateStatus: Global status changed, new status '(.*)', prev status '(.*)'/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QNetworkStreamingManager::CBroadcast::UpdateStatus without current session")
+            } else {
+                currentStreaming.log.push({
+                    time,
+                    logLineNumber,
+                    message: `<b>Status in UI</b> has changed (${streamingStatusColorized(res[2])} -> ${streamingStatusColorized(res[1])})`
+                })
+            }
+        }
+
+        // QAuthHandler[livestream]::CRequestContext[https://studio-api.new.livestream.com/accounts/23/events/9984656]::Execute
+        if( res = message.match(/QAuthHandler\[livestream\]::CRequestContext\[https:\/\/studio-api.new.livestream.com\/accounts\/(\d+)\/events\/(\d+)]::Execute/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QAuthHandler[livestream]::CRequestContext without current session")
+            } else {
+                const url = `https://livestream.com/accounts/${parseInt(res[1])}/events/${parseInt(res[2])}`;
+                currentStreaming.livestreamEventUrls = currentStreaming.livestreamEventUrls || new Set();
+                if(!currentStreaming.livestreamEventUrls.has(url)) {
+                    currentStreaming.livestreamEventUrls.add(url);
+                    currentStreaming.log.push({
+                        time,
+                        logLineNumber,
+                        message: `New Livestream Event URL found: <a href="${url}">${url}</a>`
+                    })
+                }
+            }
+        }
+
+        // QVimeoChangeVideo::QVimeoChangeVideo access_token=297209bf50fb633ec6dd335f6443b67d, video_path=videos/659336952, new_video_state=ready
+        if( res = message.match(/QVimeoChangeVideo::QVimeoChangeVideo access_token=.*, video_path=videos\/(\d+), new_video_state=.*/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QVimeoChangeVideo::QVimeoChangeVideo without current session")
+            } else {
+                const url = `https://vimeo.com/${res[1]}`;
+                currentStreaming.vimeoClipUrls = currentStreaming.vimeoClipUrls || new Set();
+                if(!currentStreaming.vimeoClipUrls.has(url)) {
+                    currentStreaming.vimeoClipUrls.add(url);
+                    currentStreaming.log.push({
+                        time,
+                        logLineNumber,
+                        message: `New Vimeo Clip URL found: <a href="${url}">${url}</a>`
+                    })
+                }
+            }
+        }
+
+        // QtLS::QRTMPProvider::CreateBroadcast stream_url=rtmp://localhost:1935/live, stream_name=server1
+        if( res = message.match(/QtLS::QRTMPProvider::CreateBroadcast stream_url=(.*), stream_name=(.*)/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QtLS::QRTMPProvider::CreateBroadcast without current session")
+            } else {
+                const url = `${res[1]}/${res[2]}`;
+                currentStreaming.rtmpUrls = currentStreaming.rtmpUrls || new Set();
+                if(!currentStreaming.rtmpUrls.has(url)) {
+                    currentStreaming.rtmpUrls.add(url);
+                    currentStreaming.log.push({
+                        time,
+                        logLineNumber,
+                        message: `Custom RTMP URL found: ${url}`
+                    })
+                }
+            }
+
+        }
+
+        // QMultiStreamSessionBase[vimeo]::Init profiles=3
+        if( res = message.match(/QMultiStreamSessionBase\[(.*)\]::Init profiles=\d+/) ) {
+            if(!currentStreaming) {
+                // it's possible that part of log with RequestStartStreaming was trimmed
+                console.log("QMultiStreamSessionBase::Init without current session")
+            } else {
+                const provider = res[1];
+                currentStreaming.destinations = currentStreaming.destinations || new Set();
+                currentStreaming.destinations.add(provider);
+            }
+        }
+
+        // Debug statistics [00:10:13]:
+	    // Current status: src_a=[Webcam 1] 01BC8F57E21F46517D src_b=[RTMP server 1] 0BBC8F57E21F46517D mix_portion=0.00 cpu_usage=38%
+	    // Memory usage: Process: physical 1195.03M, virtual 6313.07M/17592186044416.00M (0.0%); System: physical 11248.70M/16384.00M (68.7%)
+        if( message.startsWith("Debug statistics [") ) {
+            // debug statistics contains lots of useful information, currently we get only cpu/memory usage
+
+            ctx.debugInfo = ctx.debugInfo || {};
+
+            if( res = message.match(/cpu_usage=(\d+)%/) ) {
+                ctx.debugInfo.cpuMeasures = ctx.debugInfo.cpuMeasures || [];
+                ctx.debugInfo.cpuMeasures.push(parseInt(res[1]));
+            } else {
+                console.log("no cpu_usage in debug info", message)
+                throw new Error("no cpu usage in debug info");
+            }
+
+            if( res = message.match(/Memory usage: Process: physical (\d+)\.\d+M/) ) {
+                ctx.debugInfo.memoryMeasures = ctx.debugInfo.memoryMeasures || [];
+                ctx.debugInfo.memoryMeasures.push(parseInt(res[1]));
+            } else {
+                console.log("no Memory usage in debug info", message)
+                throw new Error("Memory usage usage in debug info");
+            }
+        }
+      }
+
+      function generateReport(ctx) {
+        let html = "";
+
+        const append = (message) => html += `${message}\n`;
+        const appendP = (message) => append(`<p class="gi">${message}</p>`)
+
+        const time = (value) =>  value.toLocaleDateString() + " " + value.toLocaleTimeString();
+
+        append("<h1>General information</h1>");
+
+        {
+            const studioVersion = ctx.studioVersion || ctx.analytics?.studioVersion;
+            const isBeta = ctx.isBeta || ctx.analytics?.isBeta
+            appendP(`<b>Studio Version</b>: ${studioVersion ? `${studioVersion} ${isBeta ? red('BETA') : ""}` :  yellow("unknown (possible with really short logs, otherwise it's a bug in analyzer)")}`);
+        }
+
+        {
+            const platform = ctx.platform || ctx.analytics?.platform;
+            const osVersion = ctx.analytics?.osVersion;
+
+            if(!platform) {
+                appendP(`<b>Operating System</b>: ${yellow("unknown (possible with really short logs, otherwise it's a bug in analyzer)")}`);
+            } else {
+                appendP(`<b>Operating System</b>: ${platform} ${osVersion ? `(${osVersion})` : ""}`)
+            }
+        }
+
+        appendP(`<b>Open Time</b>: ${ctx.launchedAt ? time(ctx.launchedAt) : yellow("unknown (if crisis_log is provided, likely it was trimmed off; this information might be found in primary_log)")}`)
+        appendP(`<b>Close Time</b>: ${ctx.stoppedAt ? time(ctx.stoppedAt) : yellow("unknown (it might mean that log was captured while Studio was running or indicate that Studio has crashed)")}`)
+
+        if(ctx.launchedAt && ctx.stoppedAt) {
+            appendP(`<b>Total running time</b>: ${((ctx.stoppedAt - ctx.launchedAt)/1000/60).toFixed(0)} min(s)`)
+        }
+
+        if(ctx.launchedAt && ctx.shownAt) {
+            const secsToShow = (ctx.shownAt - ctx.launchedAt) / 1000;
+            const msg = secsToShow < 30 ? green(`${secsToShow.toFixed(0)}s`) : yellow(`${secsToShow.toFixed(0)}s`);
+            appendP(`<b>Time to Show UI</b>: ${msg}`)
+        } else if(ctx.launchedAt) {
+            appendP(`<b>Time to Show UI</b>: ${red("unknown (possibly Studio has crashed before UI has been shown")}`)
+        }
+
+        if(ctx.analytics?.licenseType) {
+            appendP(`<b>License Type</b>: ${ctx.analytics.licenseType}`)
+
+            ctx.analytics.vimeoUserUris?.forEach((v) => appendP(`<b>Authorized as Vimeo User</b>: <a href="${v}">${v}</a>`))
+        }
+
+        if(ctx.streaming?.hwEnc) {
+            appendP(`<b>Hardware Encoding</b>: ${ctx.streaming.hwEnc.size > 0 ? `${green("Available")} (${[...ctx.streaming.hwEnc.keys()].join(", ")})` : red("Not Available")}`)
+        }
+
+        if(ctx.format) {
+            let formatMessage = "";
+            let colorifier = green;
+
+            if(ctx.format.videoHeight > 1080) {
+                colorifier = yellow;
+                formatMessage = yellow("(4K video requires additional CPU resources and are not widely supported, suggest to switch to 1080p or lower)")
+            } else if(ctx.format.frameShape !== "16:9") {
+                colorifier = yellow;
+                formatMessage = yellow(`(aspect ${ctx.format.frameShape} is different of 16:9, suggest to use 720p 16:9 or 1080p 16:9)`)
+            } else if(ctx.format.interlaced) {
+                colorifier = yellow;
+                formatMessage = yellow(`(legacy interlaced mode activated, suggest to use 1080p30 or 720p30)`)
+            } else if( ctx.format.frameRateNum / ctx.format.frameRateDen > 30 ) {
+                colorifier = yellow;
+                formatMessage = yellow(`(60fps mode is activated, it requires additional CPU resources but Vimeo doesn't support it and viewers see 30fps only, suggest to switch to p30)`)
+            }
+
+            appendP(`<b>Studio Format</b>: ${colorifier(`${ctx.format.videoHeight}${ctx.format.interlaced ? "i" : "p"} ${(ctx.format.frameRateNum / ctx.format.frameRateDen).toFixed(2)}fps`)} ${formatMessage}`)
+        }
+
+        if(ctx.debugInfo?.cpuMeasures.length > 0) {
+            const maxCpuUsage = Math.max(...ctx.debugInfo.cpuMeasures)
+
+            const text = maxCpuUsage < 70 ? green(`${maxCpuUsage}%`) : maxCpuUsage < 85 ? yellow(`${maxCpuUsage}%`) : red(`${maxCpuUsage}%, user likely has performance issues, so they need to tune Studio Desktop settings, e.g. decrease streaming resolution`)
+
+            appendP(`<b>Max CPU Usage</b>: (Estimation is extremely inaccurate) ${text}`)
+        }
+
+        if(ctx.debugInfo?.memoryMeasures.length > 0) {
+            const maxMemoryUsage = Math.max(...ctx.debugInfo.memoryMeasures)
+
+            const text = maxMemoryUsage < 2048 ? green(`${maxMemoryUsage}Mb`) : maxMemoryUsage < 4096 ? yellow(`${maxMemoryUsage}Mb`) : red(`${maxMemoryUsage}Mb, user likely has performance issues or it's a bug of Studio Desktop`)
+
+            appendP(`<b>Max Memory Usage</b>: (Estimation is extremely inaccurate) ${text}`)
+        }
+
+        append("<h2>Devices</h2>")
+
+        append("<details>");
+        append("<summary>Click to expand/collapse</summary>");
+
+
+        if(ctx.devices?.blackMagicDriverVersion) {
+            appendP(`<b>BlackMagic Driver</b>: ${ctx.devices?.blackMagicDriverVersion}`)
+        } else if(ctx.launchedAt) {
+            // we have whole log but no blackmagic driver version record found
+            appendP(`<b>BlackMagic Driver</b>: unknown, likely BM driver is not installed`)
+        } else {
+            appendP(`<b>BlackMagic Driver</b>: unknown`)
+        }
+
+        if(ctx.devices?.list && Object.keys(ctx.devices.list).length > 0) {
+            append(`
+                <table>
+                    <tr>
+                        <th>ID</th>
+                        <th>Name</ht>
+                        <th>Capabilities</th>
+                    </tr>
+                    ${Object.keys(ctx.devices.list).map((id) => `
+                    <tr>
+                        <td>${id}</td>
+                        <td>${ctx.devices.list[id].name}</td>
+                        <td>${ctx.devices.list[id].isCaptureDevice ? "capture" : ""} ${ctx.devices.list[id].isStreamingDevice ? "streaming" : ""}</td>
+                    </tr>
+                    `).join("")}
+                </table>
+            `)
+
+        } else if(ctx.launchedAt) {
+            // we have whole log but no devices found
+            appendP(yellow("No Devices Found"));
+        }
+
+        if(ctx.devices?.log) {
+            append("<h3>Event Log</h3>")
+
+            append(`
+                <table>
+                    <tr>
+                        <th>Time</th>
+                        <th>Device ID</ht>
+                        <th>Event</th>
+                    </tr>
+                    ${ctx.devices.log.map((v) => `
+                    <tr>
+                        <td>${time(v.time)}</td>
+                        <td>${v.id}</td>
+                        <td>${v.message}</td>
+                    </tr>
+                    `).join("")}
+                </table>
+            `)
+        }
+
+        append("</details>");
+
+        if(ctx.remoteGuests) {
+            append("<h2>Remote Guests</h2>")
+
+            append("<details>");
+            append("<summary>Click to expand/collapse</summary>");
+
+            ctx.remoteGuests?.ids.forEach((v) => {
+                const link = `https://vimeo.com/live/guest/${v.replace(".", "")}`
+                appendP(`<b>Remote Guest Link</b>: ${link}`)
+            });
+
+            const knownIds = [];
+            const uniqueIdToIndex = (id) => {
+                const pos = knownIds.indexOf(id);
+                if(pos >= 0) {
+                    return pos;
+                }
+                knownIds.push(id);
+                return knownIds.length - 1;
+            }
+
+            const events = [];
+            ctx.analytics?.events?.forEach((v) => {
+                switch(v.event) {
+                case "Live Interview Guest Joined":
+                    events.push({
+                        time: v.time,
+                        message: `Guest #${uniqueIdToIndex(v.properties.guest_id)} Joined (${v.properties.guest_device}/${v.properties.guest_browser})`
+                    })
+                    break;
+                case "Live Interview Guest Removed":
+                    events.push({
+                        time: v.time,
+                        message: `Guest #${uniqueIdToIndex(v.properties.guest_id)} Left`
+                    })
+                    break;
+                case "Live Interview Autocomposite Added":
+                    events.push({
+                        time: v.time,
+                        message: "Composite layer added"
+                    })
+                    break;
+                case "Studio Remote Gusts Advanced Settings Changed":
+                    events.push({
+                        time: v.time,
+                        message: "Remote Guests advanced settings changed"
+                    })
+                    break;
+                }
+            })
+
+            if(events.length > 0) {
+
+            append(`
+                <table>
+                    <tr>
+                        <th>Time</th>
+                        <th>Event</th>
+                    </tr>
+                    ${events.map((v) => `
+                    <tr>
+                        <td>${time(v.time)}</td>
+                        <td>${v.message}</td>
+                    </tr>
+                    `).join("")}
+                </table>
+            `)
+
+            } else {
+                appendP(yellow("No Remote Guest Related Events Found"));
+
+            }
+
+            append("</details>");
+        }
+
+        ctx.streaming.sessions?.forEach((session, index) => {
+            let name = time(session.startRequestedAt);
+
+            if(session.stopRequestedAt) {
+                name += ", " + ((session.stopRequestedAt-session.startRequestedAt)/1000/60).toFixed(0) + "mins"
+            }
+            append(`<h2>Streaming Session #${index+1} [${name}]</h2>`)
+
+            append("<details>");
+            append("<summary>Click to expand/collapse</summary>");
+
+            appendP(`<b>Start Time</b>: ${time(session.startRequestedAt)}`)
+            appendP(`<b>Stop Time</b>: ${session.stopRequestedAt ? time(session.stopRequestedAt) : yellow("unknown, possibly session is not stopped at the end of the log")}`)
+
+            if(session.stopRequestedAt) {
+                if(session.processingError === "unknown") {
+                    appendP(`<b>Stop Reason</b>: ${red("Unknown")}`)
+                } else if(session.processingError !== undefined) {
+                    appendP(`<b>Stop Reason</b>: ${red(`Error: ${streamingFailureErrorCodeToHumanString(session.processingError)}`)}`)
+                } else {
+                    appendP(`<b>Stop Reason</b>: ${green("Stopped By User")}`)
+                }
+            }
+
+            if(session.config && session.config.profilesCount > 1 && !session.multiPresetQualityMakesSense) {
+                appendP(`<b>Misconfiguration</b>: ${yellow("Streaming profile with multiple encoder presets used without Livestream provider, this configuration makes no sense as only higher rendition is used but requires additional CPU resources")}`)
+            }
+
+            if(session.config && session.config.keyFrameInterval != 2) {
+                if(session.config.keyFrameInterval >= 2 && session.config.keyFrameInterval < 5) {
+                    appendP(`<b>Custom Configuration</b>: ${yellow(`Keyframe interval changed to ${session.config.keyFrameInterval}s`)}`)
+                } else if(session.config.keyFrameInterval < 2) {
+                    appendP(`<b>Custom Configuration</b>: ${red(`Keyframe interval is too low (${session.config.keyFrameInterval}s`)}), it might lead to significantly increased video bitrate`)
+                } else {
+                    appendP(`<b>Custom Configuration</b>: ${red(`Keyframe interval is too high (${session.config.keyFrameInterval}s`)}), it might lead to problems with playback on some platforms, including Vimeo`)
+                }
+            }
+
+            if(session.config && session.config.cbr) {
+                appendP(`<b>Custom Configuration</b>: ${yellow(`CBR is set ON`)}`)
+            }
+
+            if(session.config && session.config.stopEncodingQueueSize != 300) {
+                if(session.config.stopEncodingQueueSize >= 100 && session.config.stopEncodingQueueSize < 1000) {
+                    appendP(`<b>Custom Configuration</b>: ${yellow(`stopEncodingQueueSize interval changed to ${session.config.stopEncodingQueueSize} frames`)}`)
+                } else if(session.config.stopEncodingQueueSize < 100) {
+                    appendP(`<b>Custom Configuration</b>: ${red(`stopEncodingQueueSize is too low (${session.config.stopEncodingQueueSize} frames`)}), it might lead to streaming stopped in case of CPU usage fluctuation`)
+                } else {
+                    appendP(`<b>Custom Configuration</b>: ${red(`stopEncodingQueueSize interval is too high (${session.config.stopEncodingQueueSize} frames`)}), it might lead to increased RAM memory usage by Studio Desktop (and further crashes) in case of performance problems`)
+                }
+            }
+
+            if(session.destinations) {
+                appendP(`<b>Destinations</b>: ${[...session.destinations.keys()].join(", ")}`)
+            }
+
+            session.vimeoClipUrls?.forEach((v) => appendP(`<b>Vimeo Clip URL</b>: <a href=${v}>${v}</a>`))
+
+            session.livestreamEventUrls?.forEach((v) => appendP(`<b>Livestream Event URL</b>: <a href=${v}>${v}</a>`))
+
+            session.rtmpUrls?.forEach((v) => appendP(`<b>Custom RTMP URL</b>: ${v}`))
+
+            append(`
+                <table>
+                    <tr>
+                        <th>Line No</th>
+                        <th>Time</th>
+                        <th>Event</th>
+                    </tr>
+                    ${session.log.map((v) => `
+                    <tr>
+                        <td>${v.logLineNumber}</td>
+                        <td>${time(v.time)}</td>
+                        <td>${v.message}</td>
+                    </tr>
+                    `).join("")}
+                </table>
+            `)
+
+
+
+            append("</details>");
+        })
+
+        if(ctx.analytics?.events) {
+            append("<h2>Mixpanel Events</h2>")
+
+            append("<details>");
+            append("<summary>Click to expand/collapse</summary>");
+
+            append(`
+                <table>
+                    <tr>
+                        <th>Line No</th>
+                        <th>Time</th>
+                        <th>Event</th>
+                        <th>Properties</th>
+                    </tr>
+                    ${ctx.analytics.events.map((v) => `
+                    <tr>
+                        <td>${v.logLineNumber}</td>
+                        <td>${time(v.time)}</td>
+                        <td><b>${v.event.replace(/\s/g, "&nbsp;")}</b></td>
+                        <td>
+                            <details>
+                                <summary>Show/hide properties</summary>
+                                <pre>${JSON.stringify(v.properties, null, 4)}</pre>
+                            </deatils>
+                        </td>
+                    </tr>
+                    `).join("")}
+                </table>
+            `)
+
+            append("</details>");
+
+        }
+
+
+
+        document.getElementById("report").innerHTML = html;
+      }
+
+      function parseLog(body) {
+          const lines = body.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").reduce((res,text,lineNumber) => {
+            const line = text.match(/(\d+\.\d+\.\d+\s\d+:\d+:\d+\.\d+)\s\(Thread ID=(\d+)\)\s\[([^\]]+)\]\s(.*)$/s);
+            if(!line) {
+                // likely it's part of previous mnultiline log message
+                if(res.length == 0) {
+                    // it doesn't start with our log prefix
+                    throw new Error("invalid file provided");
+                }
+                res[res.length-1].message += "\n" + text;
+            } else {
+                res.push({
+                    time: new Date(line[1]),
+                    timeRaw: line[1],
+                    verbosity: line[3],
+                    threadId: line[2],
+                    message: line[4],
+                    lineNumber: lineNumber + 1
+                });
+            }
+            return res;
+          }, [])
+
+          console.log("Found log lines", lines.length);
+          window.logLines = lines;
+          const ctx = {};
+          lines.forEach((v) => parseLogLine(v.lineNumber, v.time, v.verbosity, v.threadId, v.message, ctx))
+          console.log(ctx);
+          window.context = ctx;
+          generateReport(ctx);
+      }
+
+      function load(file) {
+          console.log(file);
+          const reader = new FileReader();
+            reader.readAsText(file, "UTF-8");
+            reader.onload = (evt) => {
+                try {
+                    parseLog(evt.target.result);
+                } catch(e) {
+                    alert(e.toString());
+                }
+            }
+            reader.onerror = (evt) => {
+                console.error("Error reading file", file, evt);
+                alert("Can't read file");
+            }
+
+      }
+  </script>
+<body>
+    <div>
+        <input type="file" id="fileName" accept=".txt" onchange="load(this.files[0])">
+    </div>
+    <div id="report"></div>
+</body>
+</html>
