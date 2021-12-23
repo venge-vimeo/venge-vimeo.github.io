@@ -7,14 +7,24 @@
         background: #fff;
       }
 
+      table {
+          border:none;
+      }
+
       table td {
         padding: 3px;
       }
 
-      th,
-      td {
-        border-bottom: 1px solid lightgrey;
-        border-collapse: collapse;
+      tr:nth-child(even) {
+          background: #eee;
+      }
+
+      tr td:first-child {
+        border-radius: 4px 0 0 4px;
+      }
+
+      tr td:last-child {
+        border-radius: 0 4px 4px 0;
       }
 
       p {
@@ -70,9 +80,8 @@
           color: #809fff;
         }
 
-        th,
-        td {
-          border-bottom-color: #555;
+        tr:nth-child(even) {
+            background: #333636;
         }
 
         p.gi > b {
@@ -80,7 +89,7 @@
         }
 
         summary {
-          background: #282a2a;
+          background: #3c3f3f;
         }
 
         span.ok {
@@ -669,7 +678,7 @@
 
         if(ctx.devices?.list && Object.keys(ctx.devices.list).length > 0) {
             append(`
-                <table>
+                <table cellspacing="0" cellpadding="0">
                     <tr>
                         <th>ID</th>
                         <th>Name</ht>
@@ -694,7 +703,7 @@
             append("<h3>Event Log</h3>")
 
             append(`
-                <table>
+                <table cellspacing="0" cellpadding="0">
                     <tr>
                         <th>Time</th>
                         <th>Device ID</ht>
@@ -767,7 +776,7 @@
             if(events.length > 0) {
 
             append(`
-                <table>
+                <table cellspacing="0" cellpadding="0">
                     <tr>
                         <th>Time</th>
                         <th>Event</th>
@@ -852,7 +861,7 @@
             session.rtmpUrls?.forEach((v) => appendP(`<b>Custom RTMP URL</b>: ${v}`))
 
             append(`
-                <table>
+                <table cellspacing="0" cellpadding="0">
                     <tr>
                         <th>Line No</th>
                         <th>Time</th>
@@ -880,7 +889,7 @@
             append("<summary>Click to expand/collapse</summary>");
 
             append(`
-                <table>
+                <table cellspacing="0" cellpadding="0">
                     <tr>
                         <th>Line No</th>
                         <th>Time</th>
