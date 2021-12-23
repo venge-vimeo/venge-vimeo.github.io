@@ -39,7 +39,6 @@
         border: 1px solid #aaa;
         border-radius: 4px;
         padding: .5em .5em 0;
-        display: inline-block;
       }
 
       summary {
@@ -68,6 +67,10 @@
 
       span.err {
         color: red;
+      }
+
+      #report > details {
+        margin-bottom: .5em;
       }
 
       @media (prefers-color-scheme: dark) {
@@ -661,11 +664,8 @@
             appendP(`<b>Max Memory Usage</b>: (Estimation is extremely inaccurate) ${text}`)
         }
 
-        append("<h2>Devices</h2>")
-
         append("<details>");
-        append("<summary>Click to expand/collapse</summary>");
-
+        append("<summary>Devices</summary>");
 
         if(ctx.devices?.blackMagicDriverVersion) {
             appendP(`<b>BlackMagic Driver</b>: ${ctx.devices?.blackMagicDriverVersion}`)
@@ -723,10 +723,8 @@
         append("</details>");
 
         if(ctx.remoteGuests) {
-            append("<h2>Remote Guests</h2>")
-
             append("<details>");
-            append("<summary>Click to expand/collapse</summary>");
+            append("<summary>Remote Guests</summary>");
 
             ctx.remoteGuests?.ids.forEach((v) => {
                 const link = `https://vimeo.com/live/guest/${v.replace(".", "")}`
@@ -804,10 +802,9 @@
             if(session.stopRequestedAt) {
                 name += ", " + ((session.stopRequestedAt-session.startRequestedAt)/1000/60).toFixed(0) + "mins"
             }
-            append(`<h2>Streaming Session #${index+1} [${name}]</h2>`)
 
             append("<details>");
-            append("<summary>Click to expand/collapse</summary>");
+            append(`<summary>Streaming Session #${index+1} [${name}]</summary>`);
 
             appendP(`<b>Start Time</b>: ${time(session.startRequestedAt)}`)
             appendP(`<b>Stop Time</b>: ${session.stopRequestedAt ? time(session.stopRequestedAt) : yellow("unknown, possibly session is not stopped at the end of the log")}`)
@@ -883,10 +880,8 @@
         })
 
         if(ctx.analytics?.events) {
-            append("<h2>Mixpanel Events</h2>")
-
             append("<details>");
-            append("<summary>Click to expand/collapse</summary>");
+            append("<summary>Mixpanel Events</summary>");
 
             append(`
                 <table cellspacing="0" cellpadding="0">
